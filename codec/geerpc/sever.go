@@ -38,7 +38,7 @@ func (server *Server) Accept(lis net.Listener) {
 			log.Println("rpc server: accept error:", err)
 			return
 		}
-		go server.ServeConn(conn)
+		server.ServeConn(conn)
 	}
 }
 
@@ -51,10 +51,12 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		_ = conn.Close()
 	}()
 	var opt Option
+	log.Println("-------")
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
 		log.Println("rpc server: options error: ", err)
 		return
 	}
+	log.Printf("%v  %v", opt.MagicNumber, opt.CodecType)
 	if opt.MagicNumber != MagicNumber {
 		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
 		return
@@ -67,6 +69,8 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	server.serveCodec(f(conn))
 }
 
+var invalidRequest = struct{}{}
+
 func (server *Server) serveCodec(cc codec.Codec) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
@@ -77,11 +81,16 @@ func (server *Server) serveCodec(cc codec.Codec) {
 			if req == nil {
 				break
 			}
-			req.h.Error =  err.Error()
-			server.
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			continue
 		}
-
+		wg.Add(1)
+		go server.handleRequest(cc, req, sending, wg)
 	}
+
+	wg.Wait()
+	_ = cc.Close()
 }
 
 type request struct {
@@ -106,19 +115,17 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 		return nil, err
 	}
 	req := &request{h: h}
-	req.argv  =  reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface());err != nil{
+	req.argv = reflect.New(reflect.TypeOf(""))
+	if err = cc.ReadBody(req.argv.Interface()); err != nil {
 		log.Println("rpc server: read argv err:", err)
 	}
 	return req, nil
 }
 
-
-
 func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
-	if err := cc.Write(h,body);err !=nil{
+	if err := cc.Write(h, body); err != nil {
 		log.Println("rpc server: write response error:", err)
 	}
 }
@@ -126,5 +133,6 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Println(req.h, req.argv.Elem())
-	req.replyv  = reflect.ValueOf(fmt.Sprintf("geerpc resp %d",req.h.Seq))
+	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
