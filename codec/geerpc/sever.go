@@ -3,12 +3,15 @@ package geerpc
 import (
 	"easy-rpc/codec"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"go/ast"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 const MagicNumber = 0x3bef5c
@@ -23,7 +26,9 @@ var DefaultOption = &Option{
 	CodecType:   codec.GobType,
 }
 
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -136,3 +141,105 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
+
+type methodType struct {
+	method    reflect.Method
+	ArgType   reflect.Type
+	ReplyType reflect.Type
+	numCalls  uint64
+}
+
+func (m *methodType) NumCalls() uint64 {
+	return atomic.LoadUint64(&m.numCalls)
+}
+
+func (m *methodType) NewArgv() reflect.Value {
+	var argv reflect.Value
+	if m.ArgType.Kind() == reflect.Ptr {
+		argv = reflect.New(m.ArgType.Elem())
+	} else {
+		argv = reflect.New(m.ArgType).Elem()
+	}
+	return argv
+}
+
+func (m *methodType) NewReplyv() reflect.Value {
+	r := reflect.New(m.ReplyType.Elem())
+	switch m.ReplyType.Elem().Kind() {
+	case reflect.Map:
+		r.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
+	case reflect.Slice:
+		r.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
+	}
+	return r
+}
+
+type service struct {
+	name   string
+	typ    reflect.Type
+	rcvr   reflect.Value
+	Method map[string]*methodType
+}
+
+func NewService(rcvr interface{}) *service {
+	s := new(service)
+	s.rcvr = reflect.ValueOf(rcvr)
+	s.name = reflect.Indirect(s.rcvr).Type().Name()
+	s.typ = reflect.TypeOf(rcvr)
+	if !ast.IsExported(s.name) {
+		log.Fatalf("rpc server: %s is not a valid service name", s.name)
+	}
+	s.registerMethods()
+	return s
+}
+
+func (s *service) registerMethods() {
+	s.Method = make(map[string]*methodType)
+
+	for i := 0; i < s.typ.NumMethod(); i++ {
+		m := s.typ.Method(i)
+		mT := m.Type
+		if mT.NumIn() != 3 || mT.NumOut() != 1 {
+			continue
+		}
+		if mT.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+		argType, replyType := mT.In(1), mT.In(2)
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
+			continue
+		}
+
+		s.Method[m.Name] = &methodType{
+			method:    m,
+			ArgType:   argType,
+			ReplyType: replyType,
+		}
+		log.Printf("rpc server: register %s.%s\n", s.name, m.Name)
+	}
+}
+
+func isExportedOrBuiltinType(t reflect.Type) bool {
+	return ast.IsExported(t.Name()) || t.PkgPath() == ""
+}
+
+func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
+	atomic.AddUint64(&m.numCalls, 1)
+	f := m.method.Func
+	returnValues := f.Call([]reflect.Value{s.rcvr, argv, replyv})
+
+	if errInter := returnValues[0].Interface(); errInter != nil {
+		return errInter.(error)
+	}
+	return nil
+}
+
+func (server *Server) Register(rcvr interface{}) error {
+	s := NewService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
